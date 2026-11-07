@@ -332,4 +332,905 @@ class FootprintDatabase {
   }
 }
 const dbEngine = new FootprintDatabase();
-// === END OF PART 1 — PASTE PART 2 IMMEDIATELY BELOW THIS LINE ===
+
+// === START OF PART 2 ===
+// ============================================================================
+// 4. FOOTPRINT CHART PANE CLASS (REST + WEBSOCKET + ORDER FLOW ENGINE + CANVAS)
+// ============================================================================
+const TIMEFRAME_MS = {
+  "1m": 60 * 1000,
+  "5m": 5 * 60 * 1000,
+  "15m": 15 * 60 * 1000,
+  "1h": 60 * 60 * 1000,
+  "4h": 4 * 60 * 60 * 1000
+};
+
+class FootprintPane {
+  constructor(paneIndex, containerEl, defaultCfg) {
+    this.index = paneIndex;
+    this.exchange = defaultCfg.exchange; // BYBIT_LINEAR, BYBIT_INVERSE, BINANCE_FUTURES, BINANCE_SPOT
+    this.symbol = defaultCfg.symbol;     // BTCUSDT, BTCUSD
+    this.tf = defaultCfg.tf || "5m";
+    this.priceStep = defaultCfg.priceStep || 25; // Price bin grouping ($)
+    this.candles = [];
+    this.ws = null;
+    this.pingTimer = null;
+    this.saveTimer = null;
+    this.whaleTrades = [];
+
+    // Viewport pan & zoom state
+    this.candleWidth = 104;
+    this.scrollOffset = 0; // 0 = pinned to latest bar
+    this.isDragging = false;
+    this.dragStartX = 0;
+    this.dragStartOffset = 0;
+    this.mouseX = -1;
+    this.mouseY = -1;
+
+    this.buildDOM(containerEl);
+    this.initDataPipeline();
+  }
+
+  get seriesKey() {
+    return `${this.exchange}_${this.symbol}_${this.tf}_${this.priceStep}`;
+  }
+
+  buildDOM(containerEl) {
+    this.el = document.createElement("div");
+    this.el.className = "chart-pane";
+    this.el.innerHTML = `
+      <div class="pane-header">
+        <div class="pane-controls">
+          <select class="ex-select">
+            <option value="BYBIT_LINEAR" ${this.exchange === "BYBIT_LINEAR" ? "selected" : ""}>Bybit USDT Perp</option>
+            <option value="BYBIT_INVERSE" ${this.exchange === "BYBIT_INVERSE" ? "selected" : ""}>Bybit USD Inv</option>
+            <option value="BINANCE_FUTURES" ${this.exchange === "BINANCE_FUTURES" ? "selected" : ""}>Binance Perp</option>
+            <option value="BINANCE_SPOT" ${this.exchange === "BINANCE_SPOT" ? "selected" : ""}>Binance Spot</option>
+          </select>
+          <input type="text" class="sym-input" value="${this.symbol}" title="Type any symbol (e.g. BTCUSDT, ETHUSDT, SOLUSDT)" />
+          <select class="tf-select">
+            <option value="1m" ${this.tf === "1m" ? "selected" : ""}>1m</option>
+            <option value="5m" ${this.tf === "5m" ? "selected" : ""}>5m</option>
+            <option value="15m" ${this.tf === "15m" ? "selected" : ""}>15m</option>
+            <option value="1h" ${this.tf === "1h" ? "selected" : ""}>1h</option>
+            <option value="4h" ${this.tf === "4h" ? "selected" : ""}>4h</option>
+          </select>
+          <select class="step-select" title="Footprint Price Bin Step">
+            <option value="5" ${this.priceStep === 5 ? "selected" : ""}>$5 Bin</option>
+            <option value="10" ${this.priceStep === 10 ? "selected" : ""}>$10 Bin</option>
+            <option value="25" ${this.priceStep === 25 ? "selected" : ""}>$25 Bin</option>
+            <option value="50" ${this.priceStep === 50 ? "selected" : ""}>$50 Bin</option>
+            <option value="100" ${this.priceStep === 100 ? "selected" : ""}>$100 Bin</option>
+          </select>
+          <button class="btn zoom-in" title="Zoom In">+</button>
+          <button class="btn zoom-out" title="Zoom Out">−</button>
+          <button class="btn reset-view" title="Jump to Live">Live</button>
+        </div>
+        <div class="pane-metrics">
+          <span class="live-price" style="font-weight:700;color:#fff">--</span>
+          <span class="live-delta" style="color:var(--text-muted)">Δ: --</span>
+          <span class="ws-state badge">Connecting...</span>
+        </div>
+      </div>
+      <div class="canvas-wrap">
+        <div class="whale-toast"></div>
+        <canvas></canvas>
+      </div>
+    `;
+    containerEl.appendChild(this.el);
+
+    this.canvas = this.el.querySelector("canvas");
+    this.ctx = this.canvas.getContext("2d");
+    this.priceEl = this.el.querySelector(".live-price");
+    this.deltaEl = this.el.querySelector(".live-delta");
+    this.wsBadge = this.el.querySelector(".ws-state");
+    this.whaleToast = this.el.querySelector(".whale-toast");
+
+    // Control Listeners
+    this.el.querySelector(".ex-select").addEventListener("change", (e) => {
+      this.exchange = e.target.value;
+      if (this.exchange === "BYBIT_INVERSE" && this.symbol.endsWith("USDT")) {
+        this.symbol = this.symbol.replace("USDT", "USD");
+        this.el.querySelector(".sym-input").value = this.symbol;
+      } else if (this.exchange !== "BYBIT_INVERSE" && this.symbol === "BTCUSD") {
+        this.symbol = "BTCUSDT";
+        this.el.querySelector(".sym-input").value = this.symbol;
+      }
+      this.reloadPipeline();
+    });
+    this.el.querySelector(".sym-input").addEventListener("change", (e) => {
+      this.symbol = e.target.value.trim().toUpperCase();
+      this.reloadPipeline();
+    });
+    this.el.querySelector(".tf-select").addEventListener("change", (e) => {
+      this.tf = e.target.value;
+      this.reloadPipeline();
+    });
+    this.el.querySelector(".step-select").addEventListener("change", (e) => {
+      this.priceStep = Number(e.target.value);
+      this.reloadPipeline();
+    });
+    this.el.querySelector(".zoom-in").addEventListener("click", () => {
+      this.candleWidth = Math.min(200, this.candleWidth + 16);
+      this.render();
+    });
+    this.el.querySelector(".zoom-out").addEventListener("click", () => {
+      this.candleWidth = Math.max(58, this.candleWidth - 16);
+      this.render();
+    });
+    this.el.querySelector(".reset-view").addEventListener("click", () => {
+      this.scrollOffset = 0;
+      this.render();
+    });
+
+    this.setupInteractions();
+    this.resizeCanvas();
+  }
+
+  setupInteractions() {
+    // Mouse & Touch Drag to Scroll History
+    const startDrag = (clientX) => {
+      this.isDragging = true;
+      this.dragStartX = clientX;
+      this.dragStartOffset = this.scrollOffset;
+    };
+    const moveDrag = (clientX, clientY) => {
+      const rect = this.canvas.getBoundingClientRect();
+      this.mouseX = clientX - rect.left;
+      this.mouseY = clientY - rect.top;
+      if (this.isDragging) {
+        const dx = clientX - this.dragStartX;
+        const barsMoved = Math.round(dx / this.candleWidth);
+        this.scrollOffset = Math.max(0, Math.min(Math.max(0, this.candles.length - 3), this.dragStartOffset + barsMoved));
+      }
+      this.render();
+    };
+    const endDrag = () => { this.isDragging = false; };
+
+    this.canvas.addEventListener("mousedown", (e) => startDrag(e.clientX));
+    window.addEventListener("mousemove", (e) => {
+      if (this.isDragging || e.target === this.canvas) moveDrag(e.clientX, e.clientY);
+    });
+    window.addEventListener("mouseup", endDrag);
+    this.canvas.addEventListener("mouseleave", () => {
+      this.mouseX = -1; this.mouseY = -1; this.render();
+    });
+
+    // Touch Events for iPhone / iPad PWA
+    this.canvas.addEventListener("touchstart", (e) => {
+      if (e.touches.length === 1) startDrag(e.touches[0].clientX);
+    }, { passive: true });
+    this.canvas.addEventListener("touchmove", (e) => {
+      if (e.touches.length === 1) moveDrag(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: true });
+    this.canvas.addEventListener("touchend", endDrag);
+
+    // Wheel Zoom
+    this.canvas.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      if (e.deltaY < 0) this.candleWidth = Math.min(200, this.candleWidth + 8);
+      else this.candleWidth = Math.max(58, this.candleWidth - 8);
+      this.render();
+    }, { passive: false });
+  }
+
+  resizeCanvas() {
+    const rect = this.canvas.parentElement.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = rect.width * dpr;
+    this.canvas.height = rect.height * dpr;
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.width = rect.width;
+    this.height = rect.height;
+    this.render();
+  }
+
+  async reloadPipeline() {
+    this.destroy();
+    this.candles = [];
+    this.scrollOffset = 0;
+    await this.initDataPipeline();
+  }
+
+  async initDataPipeline() {
+    this.wsBadge.textContent = "Loading 7D Cache...";
+    const cached = await dbEngine.loadSeries(this.seriesKey);
+    const map = new Map();
+    cached.forEach((c) => map.set(c.time, c));
+
+    // Fetch Historical REST Klines (Up to 7 Days coverage)
+    try {
+      const restCandles = await this.fetchHistoricalREST();
+      for (const rc of restCandles) {
+        const existing = map.get(rc.time);
+        if (!existing || !existing.isLiveBuilt) {
+          map.set(rc.time, rc);
+        }
+      }
+    } catch (e) {
+      console.warn("REST fallback error:", e);
+    }
+
+    this.candles = Array.from(map.values()).sort((a, b) => a.time - b.time);
+    await dbEngine.saveCandles(this.seriesKey, this.candles);
+    this.render();
+
+    // Start Live WebSocket
+    this.connectWebSocket();
+
+    // Periodic IndexedDB Auto-Save every 4 seconds
+    this.saveTimer = setInterval(() => {
+      dbEngine.saveCandles(this.seriesKey, this.candles);
+    }, 4000);
+  }
+
+  // Synthesizes realistic price-binned footprint clusters for historical REST candles
+  buildSyntheticFootprint(time, open, high, low, close, volume, takerBuyVol = null) {
+    const step = this.priceStep;
+    const minBin = Math.floor(low / step) * step;
+    const maxBin = Math.floor(high / step) * step;
+    const isBull = close >= open;
+    const buyRatio = takerBuyVol !== null && volume > 0
+      ? Math.min(0.92, Math.max(0.08, takerBuyVol / volume))
+      : (isBull ? 0.56 : 0.44);
+
+    const totalBuy = volume * buyRatio;
+    const totalSell = volume - totalBuy;
+    const bins = [];
+    for (let p = minBin; p <= maxBin; p += step) bins.push(p);
+    if (bins.length === 0) bins.push(minBin);
+
+    // Weight volume around typical price (POC region)
+    const pocCenter = (open + close + (high + low) * 0.5) / 3;
+    let weightSum = 0;
+    const weights = bins.map((p) => {
+      const dist = Math.abs(p - pocCenter) / (Math.max(step, high - low) * 0.65);
+      const w = Math.exp(-dist * dist) + 0.15;
+      weightSum += w;
+      return w;
+    });
+
+    const levels = {};
+    bins.forEach((p, idx) => {
+      const w = weights[idx] / weightSum;
+      const bias = p >= open ? (isBull ? 1.15 : 0.85) : (isBull ? 0.85 : 1.15);
+      const bVol = totalBuy * w * bias;
+      const sVol = totalSell * w * (2 - bias);
+      levels[p] = {
+        bid: Math.max(0.01, sVol),
+        ask: Math.max(0.01, bVol)
+      };
+    });
+
+    const delta = totalBuy - totalSell;
+    return {
+      time, open, high, low, close, volume,
+      buyVol: totalBuy,
+      sellVol: totalSell,
+      delta,
+      maxDelta: Math.max(0, delta * 1.25),
+      minDelta: Math.min(0, delta * 1.25),
+      levels,
+      isLiveBuilt: false
+    };
+  }
+
+  async fetchHistoricalREST() {
+    const results = [];
+    if (this.exchange.startsWith("BYBIT")) {
+      const cat = this.exchange === "BYBIT_INVERSE" ? "inverse" : "linear";
+      const tfMap = { "1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240" };
+      const interval = tfMap[this.tf] || "5";
+      const url = `https://api.bybit.com/v5/market/kline?category=${cat}&symbol=${this.symbol}&interval=${interval}&limit=200`;
+      const res = await fetch(url).then((r) => r.json());
+      const list = (res?.result?.list || []).reverse();
+      for (const row of list) {
+        const time = Number(row[0]);
+        const open = Number(row[1]);
+        const high = Number(row[2]);
+        const low = Number(row[3]);
+        const close = Number(row[4]);
+        let vol = Number(row[5]);
+        if (cat === "inverse" && close > 0) vol = vol / close; // Convert USD contracts to BTC
+        results.push(this.buildSyntheticFootprint(time, open, high, low, close, vol, null));
+      }
+    } else {
+      const base = this.exchange === "BINANCE_FUTURES"
+        ? "https://fapi.binance.com/fapi/v1/klines"
+        : "https://api.binance.com/api/v3/klines";
+      const url = `${base}?symbol=${this.symbol}&interval=${this.tf}&limit=250`;
+      const list = await fetch(url).then((r) => r.json());
+      if (Array.isArray(list)) {
+        for (const row of list) {
+          const time = Number(row[0]);
+          const open = Number(row[1]);
+          const high = Number(row[2]);
+          const low = Number(row[3]);
+          const close = Number(row[4]);
+          const vol = Number(row[5]);
+          const takerBuy = Number(row[9]);
+          results.push(this.buildSyntheticFootprint(time, open, high, low, close, vol, takerBuy));
+        }
+      }
+    }
+    return results;
+  }
+
+  connectWebSocket() {
+    if (this.ws) { try { this.ws.close(); } catch (e) {} }
+    clearInterval(this.pingTimer);
+
+    if (this.exchange.startsWith("BYBIT")) {
+      const streamType = this.exchange === "BYBIT_INVERSE" ? "inverse" : "linear";
+      this.ws = new WebSocket(`wss://stream.bybit.com/v5/public/${streamType}`);
+      this.ws.onopen = () => {
+        this.wsBadge.textContent = "LIVE WS";
+        this.wsBadge.style.color = "#10b981";
+        this.ws.send(JSON.stringify({ op: "subscribe", args: [`publicTrade.${this.symbol}`] }));
+        this.pingTimer = setInterval(() => {
+          if (this.ws.readyState === 1) this.ws.send(JSON.stringify({ op: "ping" }));
+        }, 20000);
+      };
+      this.ws.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.topic && msg.data) {
+          for (const t of msg.data) {
+            const price = Number(t.p);
+            let qty = Number(t.v);
+            if (this.exchange === "BYBIT_INVERSE" && price > 0) qty = qty / price;
+            const isBuyerAggressor = t.S === "Buy";
+            this.processLiveTick(price, qty, isBuyerAggressor, Number(t.T));
+          }
+        }
+      };
+    } else {
+      const wsBase = this.exchange === "BINANCE_FUTURES"
+        ? "wss://fstream.binance.com/ws"
+        : "wss://stream.binance.com:9443/ws";
+      this.ws = new WebSocket(`${wsBase}/${this.symbol.toLowerCase()}@aggTrade`);
+      this.ws.onopen = () => {
+        this.wsBadge.textContent = "LIVE WS";
+        this.wsBadge.style.color = "#10b981";
+      };
+      this.ws.onmessage = (ev) => {
+        const t = JSON.parse(ev.data);
+        if (t.p) {
+          const price = Number(t.p);
+          const qty = Number(t.q);
+          const isBuyerAggressor = !t.m; // m=true means buyer is maker (so seller is aggressor)
+          this.processLiveTick(price, qty, isBuyerAggressor, Number(t.T));
+        }
+      };
+    }
+
+    this.ws.onclose = () => {
+      this.wsBadge.textContent = "Reconnecting...";
+      this.wsBadge.style.color = "#f59e0b";
+    };
+  }
+
+  processLiveTick(price, qty, isBuy, timestamp) {
+    const tfMs = TIMEFRAME_MS[this.tf] || 300000;
+    const barTime = Math.floor(timestamp / tfMs) * tfMs;
+    const binPrice = Math.floor(price / this.priceStep) * this.priceStep;
+
+    let bar = this.candles[this.candles.length - 1];
+    if (!bar || bar.time < barTime) {
+      bar = {
+        time: barTime, open: price, high: price, low: price, close: price,
+        volume: 0, buyVol: 0, sellVol: 0, delta: 0, maxDelta: 0, minDelta: 0,
+        levels: {}, isLiveBuilt: true
+      };
+      this.candles.push(bar);
+    } else {
+      bar.high = Math.max(bar.high, price);
+      bar.low = Math.min(bar.low, price);
+      bar.close = price;
+      bar.isLiveBuilt = true;
+    }
+
+    bar.volume += qty;
+    if (isBuy) bar.buyVol += qty;
+    else bar.sellVol += qty;
+
+    bar.delta = bar.buyVol - bar.sellVol;
+    bar.maxDelta = Math.max(bar.maxDelta, bar.delta);
+    bar.minDelta = Math.min(bar.minDelta, bar.delta);
+
+    if (!bar.levels[binPrice]) bar.levels[binPrice] = { bid: 0, ask: 0 };
+    if (isBuy) bar.levels[binPrice].ask += qty;
+    else bar.levels[binPrice].bid += qty;
+
+    // Update Header Live Ticker
+    this.priceEl.textContent = price.toFixed(1);
+    this.priceEl.style.color = isBuy ? "var(--bull)" : "var(--bear)";
+    this.deltaEl.textContent = `Δ: ${bar.delta >= 0 ? "+" : ""}${bar.delta.toFixed(2)}`;
+    this.deltaEl.style.color = bar.delta >= 0 ? "var(--bull)" : "var(--bear)";
+
+    // Large Trade / Whale Filter Detection
+    if (qty >= APP_CONFIG.whaleMinBTC) {
+      this.whaleTrades.unshift({
+        price, qty, isBuy, time: new Date(timestamp).toLocaleTimeString()
+      });
+      if (this.whaleTrades.length > 3) this.whaleTrades.pop();
+      this.renderWhaleToast();
+      this.triggerAlert(isBuy ? 960 : 520);
+    }
+
+    this.render();
+  }
+
+  renderWhaleToast() {
+    this.whaleToast.innerHTML = this.whaleTrades.map((w) => `
+      <div class="whale-item" style="border-left-color:${w.isBuy ? "#10b981" : "#f43f5e"}">
+        🐋 <b>${w.qty.toFixed(2)} BTC</b> ${w.isBuy ? "BUY" : "SELL"} @ $${w.price.toFixed(1)} <span style="opacity:0.7">(${w.time})</span>
+      </div>
+    `).join("");
+  }
+
+  triggerAlert(freq = 880) {
+    soundEngine.beep(freq, 0.1, "triangle");
+    this.el.classList.remove("alert-flash");
+    void this.el.offsetWidth;
+    this.el.classList.add("alert-flash");
+  }
+
+  // Computes POC, diagonal imbalances (300%), and stacked imbalances (3+ levels)
+  analyzeBarOrderFlow(bar) {
+    const prices = Object.keys(bar.levels).map(Number).sort((a, b) => a - b);
+    let pocPrice = bar.close;
+    let maxVol = -1;
+    const buyImbalances = new Set();
+    const sellImbalances = new Set();
+
+    for (const p of prices) {
+      const lv = bar.levels[p];
+      const tot = lv.bid + lv.ask;
+      if (tot > maxVol) { maxVol = tot; pocPrice = p; }
+
+      // Diagonal Imbalance: Compare Ask[p] vs Bid[p - step]
+      const lower = bar.levels[p - this.priceStep];
+      if (lower && lower.bid > 0 && lv.ask / lower.bid >= APP_CONFIG.imbalanceRatio) {
+        buyImbalances.add(p);
+      }
+      // Diagonal Sell Imbalance: Compare Bid[p] vs Ask[p + step]
+      const upper = bar.levels[p + this.priceStep];
+      if (upper && upper.ask > 0 && lv.bid / upper.ask >= APP_CONFIG.imbalanceRatio) {
+        sellImbalances.add(p);
+      }
+    }
+
+    // Stacked Imbalances (3 or more consecutive price tiers)
+    const stackedZones = [];
+    let runBuy = [], runSell = [];
+    for (const p of prices) {
+      if (buyImbalances.has(p)) runBuy.push(p);
+      else {
+        if (runBuy.length >= 3) stackedZones.push({ type: "BUY", min: runBuy[0], max: runBuy[runBuy.length - 1] });
+        runBuy = [];
+      }
+      if (sellImbalances.has(p)) runSell.push(p);
+      else {
+        if (runSell.length >= 3) stackedZones.push({ type: "SELL", min: runSell[0], max: runSell[runSell.length - 1] });
+        runSell = [];
+      }
+    }
+    if (runBuy.length >= 3) stackedZones.push({ type: "BUY", min: runBuy[0], max: runBuy[runBuy.length - 1] });
+    if (runSell.length >= 3) stackedZones.push({ type: "SELL", min: runSell[0], max: runSell[runSell.length - 1] });
+
+    const meanDelta = prices.length > 0 ? bar.delta / prices.length : 0;
+    const deltaPct = bar.volume > 0 ? (bar.delta / bar.volume) * 100 : 0;
+
+    return { prices, pocPrice, maxVol, buyImbalances, sellImbalances, stackedZones, meanDelta, deltaPct };
+  }
+
+  // ==========================================================================
+  // 5. HTML5 CANVAS 60FPS RENDERING ENGINE
+  // ==========================================================================
+  render() {
+    if (!this.ctx || !this.width || !this.height) return;
+    const ctx = this.ctx;
+    const W = this.width;
+    const H = this.height;
+
+    ctx.fillStyle = "#0b0e14";
+    ctx.fillRect(0, 0, W, H);
+
+    if (!this.candles.length) {
+      ctx.fillStyle = "#8b9bb4";
+      ctx.font = "12px monospace";
+      ctx.fillText("Fetching historical & live order flow...", 20, 40);
+      return;
+    }
+
+    // Layout Regions
+    const rightAxisW = 64;
+    const statsH = 82; // 5-row Bar Statistics table at bottom
+    const cvdH = Math.max(54, Math.floor((H - statsH) * 0.18)); // Delta Divergence + Session CVD panel
+    const chartH = H - statsH - cvdH;
+    const chartW = W - rightAxisW;
+
+    // Determine Visible Candles
+    const visibleCount = Math.max(2, Math.floor(chartW / this.candleWidth));
+    const endIdx = Math.max(1, this.candles.length - this.scrollOffset);
+    const startIdx = Math.max(0, endIdx - visibleCount);
+    const visible = this.candles.slice(startIdx, endIdx);
+
+    // Price Scaling Range
+    let minP = Infinity, maxP = -Infinity;
+    for (const c of visible) {
+      minP = Math.min(minP, Math.floor(c.low / this.priceStep) * this.priceStep);
+      maxP = Math.max(maxP, Math.ceil(c.high / this.priceStep) * this.priceStep);
+    }
+    const pad = Math.max(this.priceStep * 2, (maxP - minP) * 0.08);
+    minP -= pad; maxP += pad;
+    const priceRange = Math.max(this.priceStep, maxP - minP);
+    const priceToY = (p) => chartH - ((p - minP) / priceRange) * (chartH - 20) - 10;
+    const binPixelH = Math.max(10, Math.abs(priceToY(minP) - priceToY(minP + this.priceStep)));
+
+    // 1. Price Grid Lines & Right Axis Labels
+    ctx.strokeStyle = "#161f30";
+    ctx.fillStyle = "#64748b";
+    ctx.font = "10px monospace";
+    const gridSteps = 8;
+    for (let i = 0; i <= gridSteps; i++) {
+      const p = minP + (priceRange * i) / gridSteps;
+      const y = priceToY(p);
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(chartW, y); ctx.stroke();
+      ctx.fillText(p.toFixed(0), chartW + 6, y + 3);
+    }
+
+    // 2. Visible Session Volume Profile + VAH / VAL (70% Value Area) + Session POC
+    if (APP_CONFIG.showVP) {
+      const vpMap = new Map();
+      let totalVpVol = 0;
+      let vpMaxBinVol = 0;
+      let sessionPoc = 0;
+
+      for (const c of visible) {
+        for (const [pStr, lv] of Object.entries(c.levels)) {
+          const p = Number(pStr);
+          const cur = vpMap.get(p) || { bid: 0, ask: 0 };
+          cur.bid += lv.bid; cur.ask += lv.ask;
+          vpMap.set(p, cur);
+          const tot = cur.bid + cur.ask;
+          totalVpVol += (lv.bid + lv.ask);
+          if (tot > vpMaxBinVol) { vpMaxBinVol = tot; sessionPoc = p; }
+        }
+      }
+
+      // Compute 70% Value Area (VAH & VAL)
+      const sortedBins = Array.from(vpMap.keys()).sort((a, b) => a - b);
+      let vah = sessionPoc, val = sessionPoc;
+      if (sortedBins.length > 0) {
+        let pocIdx = sortedBins.indexOf(sessionPoc);
+        let accVol = (vpMap.get(sessionPoc)?.bid || 0) + (vpMap.get(sessionPoc)?.ask || 0);
+        let upIdx = pocIdx + 1, dnIdx = pocIdx - 1;
+        while (accVol < totalVpVol * 0.70 && (upIdx < sortedBins.length || dnIdx >= 0)) {
+          const upV = upIdx < sortedBins.length ? (vpMap.get(sortedBins[upIdx]).bid + vpMap.get(sortedBins[upIdx]).ask) : -1;
+          const dnV = dnIdx >= 0 ? (vpMap.get(sortedBins[dnIdx]).bid + vpMap.get(sortedBins[dnIdx]).ask) : -1;
+          if (upV >= dnV && upIdx < sortedBins.length) {
+            vah = sortedBins[upIdx]; accVol += upV; upIdx++;
+          } else if (dnIdx >= 0) {
+            val = sortedBins[dnIdx]; accVol += dnV; dnIdx--;
+          }
+        }
+      }
+
+      // Draw Volume Profile Histogram on Right Edge of Chart
+      const maxBarW = Math.min(110, chartW * 0.22);
+      for (const [p, lv] of vpMap.entries()) {
+        const y = priceToY(p);
+        const tot = lv.bid + lv.ask;
+        const w = vpMaxBinVol > 0 ? (tot / vpMaxBinVol) * maxBarW : 0;
+        const buyW = tot > 0 ? (lv.ask / tot) * w : 0;
+        ctx.fillStyle = "rgba(16, 185, 129, 0.22)";
+        ctx.fillRect(chartW - w, y - binPixelH / 2 + 1, buyW, Math.max(2, binPixelH - 2));
+        ctx.fillStyle = "rgba(244, 63, 94, 0.22)";
+        ctx.fillRect(chartW - w + buyW, y - binPixelH / 2 + 1, w - buyW, Math.max(2, binPixelH - 2));
+      }
+
+      // Draw VAH, VAL, and Session POC Lines
+      const drawLevelLine = (price, color, label, dashed = false) => {
+        const y = priceToY(price);
+        ctx.save();
+        ctx.strokeStyle = color; ctx.lineWidth = 1.2;
+        if (dashed) ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(chartW, y); ctx.stroke();
+        ctx.fillStyle = color; ctx.font = "bold 9px monospace";
+        ctx.fillText(`${label} ${price.toFixed(0)}`, chartW - 76, y - 3);
+        ctx.restore();
+      };
+      drawLevelLine(vah, "#a855f7", "VAH", true);
+      drawLevelLine(val, "#a855f7", "VAL", true);
+      drawLevelLine(sessionPoc, "#f59e0b", "VPOC", false);
+    }
+
+    // 3. Render Footprint Candles, Stacked Imbalances & VWAP
+    let cumPV = 0, cumVol = 0;
+    const vwapPoints = [];
+
+    visible.forEach((bar, i) => {
+      const xCenter = (i + 0.5) * this.candleWidth;
+      const xLeft = i * this.candleWidth + 3;
+      const colW = this.candleWidth - 6;
+      const isBull = bar.close >= bar.open;
+      const stats = this.analyzeBarOrderFlow(bar);
+
+      // Accumulate Session VWAP
+      const typPrice = (bar.high + bar.low + bar.close) / 3;
+      cumPV += typPrice * bar.volume;
+      cumVol += bar.volume;
+      if (cumVol > 0) vwapPoints.push({ x: xCenter, y: priceToY(cumPV / cumVol) });
+
+      // Stacked Imbalance S/R Zones
+      for (const sz of stats.stackedZones) {
+        const yTop = priceToY(sz.max) - binPixelH / 2;
+        const yBot = priceToY(sz.min) + binPixelH / 2;
+        ctx.fillStyle = sz.type === "BUY" ? "rgba(16, 185, 129, 0.14)" : "rgba(244, 63, 94, 0.14)";
+        ctx.fillRect(xLeft, yTop, chartW - xLeft, Math.max(4, yBot - yTop));
+      }
+
+      // Traditional Candle Spine on Center Axis
+      const yHigh = priceToY(bar.high);
+      const yLow = priceToY(bar.low);
+      const yOpen = priceToY(bar.open);
+      const yClose = priceToY(bar.close);
+      ctx.strokeStyle = isBull ? "#10b981" : "#f43f5e";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(xCenter, yHigh); ctx.lineTo(xCenter, yLow); ctx.stroke();
+
+      const bodyTop = Math.min(yOpen, yClose);
+      const bodyH = Math.max(3, Math.abs(yClose - yOpen));
+      ctx.fillStyle = isBull ? "rgba(16, 185, 129, 0.35)" : "rgba(244, 63, 94, 0.35)";
+      ctx.fillRect(xCenter - 4, bodyTop, 8, bodyH);
+
+      // Footprint Price Bins (Left: Volume or Bid | Right: Delta or Ask)
+      for (const p of stats.prices) {
+        const lv = bar.levels[p];
+        const y = priceToY(p);
+        const tot = lv.bid + lv.ask;
+        const cellDelta = lv.ask - lv.bid;
+        const intensity = stats.maxVol > 0 ? Math.min(0.65, (tot / stats.maxVol) * 0.6) : 0.1;
+
+        // Cell Heat Background
+        ctx.fillStyle = cellDelta >= 0
+          ? `rgba(16, 185, 129, ${intensity * 0.55})`
+          : `rgba(244, 63, 94, ${intensity * 0.55})`;
+        ctx.fillRect(xLeft, y - binPixelH / 2 + 1, colW, Math.max(8, binPixelH - 2));
+
+        // Point of Control (POC) Golden Highlight Box
+        if (p === stats.pocPrice) {
+          ctx.strokeStyle = "#f59e0b";
+          ctx.lineWidth = 1.4;
+          ctx.strokeRect(xLeft, y - binPixelH / 2 + 1, colW, Math.max(8, binPixelH - 2));
+        }
+
+        // Render Footprint Numbers if zoom level allows
+        if (this.candleWidth >= 68 && binPixelH >= 9) {
+          const leftVal = APP_CONFIG.fpMode === "VOL_DELTA" ? tot : lv.bid;
+          const rightVal = APP_CONFIG.fpMode === "VOL_DELTA" ? cellDelta : lv.ask;
+
+          ctx.font = stats.sellImbalances.has(p) ? "bold 9px monospace" : "9px monospace";
+          ctx.fillStyle = stats.sellImbalances.has(p) ? "#fda4af" : "#cbd5e1";
+          ctx.textAlign = "right";
+          ctx.fillText(leftVal.toFixed(1), xCenter - 6, y + 3);
+
+          ctx.font = stats.buyImbalances.has(p) ? "bold 9px monospace" : "9px monospace";
+          if (APP_CONFIG.fpMode === "VOL_DELTA") {
+            ctx.fillStyle = stats.buyImbalances.has(p)
+              ? "#5eead4"
+              : (rightVal >= 0 ? "#34d399" : "#fb7185");
+            ctx.textAlign = "left";
+            ctx.fillText((rightVal >= 0 ? "+" : "") + rightVal.toFixed(1), xCenter + 6, y + 3);
+          } else {
+            ctx.fillStyle = stats.buyImbalances.has(p) ? "#5eead4" : "#cbd5e1";
+            ctx.textAlign = "left";
+            ctx.fillText(rightVal.toFixed(1), xCenter + 6, y + 3);
+          }
+        }
+      }
+
+      // Delta Divergence Detector (Price HH + Negative Delta OR Price LL + Positive Delta)
+      const prev = i > 0 ? visible[i - 1] : null;
+      if (prev) {
+        const bearDiv = bar.high > prev.high && bar.delta < 0 && bar.close <= bar.open;
+        const bullDiv = bar.low < prev.low && bar.delta > 0 && bar.close >= bar.open;
+        if (bearDiv || bullDiv) {
+          ctx.fillStyle = bearDiv ? "#f43f5e" : "#10b981";
+          ctx.font = "bold 9px monospace";
+          ctx.textAlign = "center";
+          ctx.fillText(bearDiv ? "▼ ΔDIV" : "▲ ΔDIV", xCenter, bearDiv ? yHigh - 6 : yLow + 12);
+        }
+      }
+    });
+
+    // Draw Session VWAP Curve
+    if (APP_CONFIG.showVWAP && vwapPoints.length > 1) {
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      vwapPoints.forEach((pt, idx) => {
+        if (idx === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.stroke();
+    }
+
+    // 4. Sub-Panel: Delta Divergence Histogram + Session CVD Line
+    const cvdTop = chartH;
+    ctx.fillStyle = "#0e131d";
+    ctx.fillRect(0, cvdTop, W, cvdH);
+    ctx.strokeStyle = "#232d42";
+    ctx.beginPath(); ctx.moveTo(0, cvdTop); ctx.lineTo(W, cvdTop); ctx.stroke();
+
+    ctx.fillStyle = "#8b9bb4";
+    ctx.font = "bold 9px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("DELTA & SESSION CVD", 6, cvdTop + 11);
+
+    let maxAbsDelta = 1;
+    let runningCVD = 0;
+    const cvdPts = [];
+    let minCVD = Infinity, maxCVD = -Infinity;
+
+    visible.forEach((bar) => {
+      maxAbsDelta = Math.max(maxAbsDelta, Math.abs(bar.delta));
+      runningCVD += bar.delta;
+      minCVD = Math.min(minCVD, runningCVD);
+      maxCVD = Math.max(maxCVD, runningCVD);
+      cvdPts.push(runningCVD);
+    });
+
+    const zeroY = cvdTop + cvdH * 0.55;
+    visible.forEach((bar, i) => {
+      const xCenter = (i + 0.5) * this.candleWidth;
+      const barH = (bar.delta / maxAbsDelta) * (cvdH * 0.38);
+      ctx.fillStyle = bar.delta >= 0 ? "rgba(16, 185, 129, 0.65)" : "rgba(244, 63, 94, 0.65)";
+      ctx.fillRect(xCenter - this.candleWidth * 0.28, bar.delta >= 0 ? zeroY - barH : zeroY, this.candleWidth * 0.56, Math.abs(barH));
+    });
+
+    // Plot Cumulative Volume Delta (CVD) Line
+    if (cvdPts.length > 1) {
+      const cvdSpan = Math.max(1, maxCVD - minCVD);
+      ctx.strokeStyle = "#eab308";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      cvdPts.forEach((val, i) => {
+        const x = (i + 0.5) * this.candleWidth;
+        const y = cvdTop + cvdH - 8 - ((val - minCVD) / cvdSpan) * (cvdH - 20);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    // 5. Bar Statistics Table (Delta, Max Delta, Mean Delta, Delta %, Volume)
+    const statsTop = chartH + cvdH;
+    ctx.fillStyle = "#111726";
+    ctx.fillRect(0, statsTop, W, statsH);
+    ctx.strokeStyle = "#232d42";
+    ctx.beginPath(); ctx.moveTo(0, statsTop); ctx.lineTo(W, statsTop); ctx.stroke();
+
+    const rowLabels = ["Delta", "Max Δ", "Mean Δ", "Delta %", "Volume"];
+    const rowH = statsH / rowLabels.length;
+
+    visible.forEach((bar, i) => {
+      const xCenter = (i + 0.5) * this.candleWidth;
+      const st = this.analyzeBarOrderFlow(bar);
+      const vals = [
+        { text: (bar.delta >= 0 ? "+" : "") + bar.delta.toFixed(1), color: bar.delta >= 0 ? "#10b981" : "#f43f5e" },
+        { text: "+" + bar.maxDelta.toFixed(1), color: "#34d399" },
+        { text: (st.meanDelta >= 0 ? "+" : "") + st.meanDelta.toFixed(2), color: st.meanDelta >= 0 ? "#6ee7b7" : "#fda4af" },
+        { text: (st.deltaPct >= 0 ? "+" : "") + st.deltaPct.toFixed(1) + "%", color: st.deltaPct >= 0 ? "#10b981" : "#f43f5e" },
+        { text: bar.volume.toFixed(1), color: "#e2e8f0" }
+      ];
+
+      ctx.font = "9px monospace";
+      ctx.textAlign = "center";
+      vals.forEach((v, rIdx) => {
+        ctx.fillStyle = v.color;
+        ctx.fillText(v.text, xCenter, statsTop + (rIdx + 0.72) * rowH);
+      });
+    });
+
+    // Right-Side Labels for Bar Statistics
+    ctx.fillStyle = "#161d2b";
+    ctx.fillRect(chartW, statsTop, rightAxisW, statsH);
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "bold 9px monospace";
+    ctx.textAlign = "left";
+    rowLabels.forEach((lbl, rIdx) => {
+      ctx.fillText(lbl, chartW + 5, statsTop + (rIdx + 0.72) * rowH);
+    });
+
+    // 6. Crosshair Overlay
+    if (this.mouseX > 0 && this.mouseX < chartW && this.mouseY > 0 && this.mouseY < chartH) {
+      ctx.save();
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.5)";
+      ctx.beginPath();
+      ctx.moveTo(0, this.mouseY); ctx.lineTo(chartW, this.mouseY);
+      ctx.moveTo(this.mouseX, 0); ctx.lineTo(this.mouseX, chartH);
+      ctx.stroke();
+
+      const hoverPrice = minP + ((chartH - 10 - this.mouseY) / (chartH - 20)) * priceRange;
+      ctx.fillStyle = "#0284c7";
+      ctx.fillRect(chartW, this.mouseY - 8, rightAxisW, 16);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 10px monospace";
+      ctx.fillText(hoverPrice.toFixed(1), chartW + 4, this.mouseY + 4);
+      ctx.restore();
+    }
+  }
+
+  destroy() {
+    if (this.ws) { try { this.ws.close(); } catch (e) {} }
+    clearInterval(this.pingTimer);
+    clearInterval(this.saveTimer);
+  }
+}
+
+// ============================================================================
+// 6. MULTI-SCREEN GRID CONTROLLER & INITIALIZATION
+// ============================================================================
+const DEFAULT_PANES = [
+  { exchange: "BYBIT_LINEAR", symbol: "BTCUSDT", tf: "5m", priceStep: 25 },
+  { exchange: "BYBIT_INVERSE", symbol: "BTCUSD", tf: "5m", priceStep: 25 },
+  { exchange: "BINANCE_FUTURES", symbol: "BTCUSDT", tf: "5m", priceStep: 25 },
+  { exchange: "BINANCE_SPOT", symbol: "BTCUSDT", tf: "5m", priceStep: 25 }
+];
+
+let activePanes = [];
+
+function setLayout(count) {
+  APP_CONFIG.layoutCount = count;
+  const grid = document.getElementById("grid-container");
+  grid.className = `grid-${count}`;
+
+  [1, 2, 4].forEach((n) => {
+    document.getElementById(`btn-layout-${n}`).classList.toggle("active", n === count);
+  });
+
+  // Clean up old panes and instantiate requested layout count
+  activePanes.forEach((p) => p.destroy());
+  activePanes = [];
+  grid.innerHTML = "";
+
+  for (let i = 0; i < count; i++) {
+    activePanes.push(new FootprintPane(i, grid, DEFAULT_PANES[i]));
+  }
+}
+
+function updateGlobalSettings() {
+  APP_CONFIG.fpMode = document.getElementById("global-fp-mode").value;
+  APP_CONFIG.imbalanceRatio = Number(document.getElementById("global-imb-ratio").value);
+  APP_CONFIG.whaleMinBTC = Number(document.getElementById("global-whale-min").value);
+  activePanes.forEach((p) => p.render());
+}
+
+function toggleFeature(key) {
+  APP_CONFIG[key] = !APP_CONFIG[key];
+  const btnMap = { showVP: "btn-vp", showVWAP: "btn-vwap", audioAlerts: "btn-audio" };
+  document.getElementById(btnMap[key]).classList.toggle("active", APP_CONFIG[key]);
+  activePanes.forEach((p) => p.render());
+}
+
+async function clearLocalCache() {
+  await dbEngine.clearAll();
+  document.getElementById("db-status").textContent = "Cache Cleared! Reloading...";
+  setTimeout(() => location.reload(), 600);
+}
+
+window.addEventListener("resize", () => {
+  activePanes.forEach((p) => p.resizeCanvas());
+});
+
+// Boot Application
+(async function boot() {
+  await dbEngine.init();
+  setLayout(4); // Default 4-Screen Layout (Bybit Linear, Bybit Inverse, Binance Perp, Binance Spot)
+})();
+</script>
+</body>
+</html>
