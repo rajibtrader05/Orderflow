@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="OrderFlow Pro" />
+  <meta name="theme-color" content="#0b0e14" />
+  <title>OrderFlow Pro — Multi-Screen Footprint & CVD Terminal</title>
+
+  <style>
+    :root {
+      --bg-main: #0b0e14;
+      --bg-panel: #111621;
+      --bg-header: #161d2b;
+      --border: #232d42;
+      --text-main: #e2e8f0;
+      --text-muted: #8b9bb4;
+      --bull: #10b981;
+      --bear: #f43f5e;
+      --poc: #f59e0b;
+      --vwap: #38bdf8;
+      --va: #a855f7;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
+    body, html {
+      width: 100%; height: 100%; overflow: hidden;
+      background: var(--bg-main); color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Consolas, Monaco, monospace;
+      font-size: 12px;
+    }
+    #app {
+      display: flex; flex-direction: column; width: 100vw; height: 100vh;
+      padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom);
+    }
+    /* Top Master Toolbar */
+    .top-bar {
+      height: 42px; background: var(--bg-header); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 10px; gap: 8px; flex-shrink: 0; overflow-x: auto;
+    }
+    .brand {
+      font-weight: 800; font-size: 13px; color: #38bdf8; letter-spacing: 0.5px;
+      display: flex; align-items: center; gap: 6px; white-space: nowrap;
+    }
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--bull);
+      box-shadow: 0 0 8px var(--bull); display: inline-block;
+    }
+    .toolbar-group {
+      display: flex; align-items: center; gap: 6px; white-space: nowrap;
+    }
+    .btn, select, input {
+      background: #1e2738; color: var(--text-main); border: 1px solid var(--border);
+      border-radius: 4px; padding: 4px 8px; font-size: 11px; font-family: inherit;
+      cursor: pointer; outline: none; transition: all 0.15s;
+    }
+    .btn:hover, select:hover { border-color: #38bdf8; }
+    .btn.active { background: #0284c7; border-color: #38bdf8; color: #fff; font-weight: 600; }
+    .badge {
+      font-size: 10px; padding: 2px 6px; border-radius: 3px; background: #1e293b; color: var(--text-muted);
+    }
+    /* Grid Layout Container */
+    #grid-container {
+      flex: 1; display: grid; gap: 4px; background: #06080c; padding: 4px;
+      width: 100%; height: calc(100vh - 42px); overflow: hidden;
+    }
+    .grid-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+    .grid-2 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
+    .grid-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+    @media (max-width: 768px) {
+      .grid-2 { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+      .grid-4 { grid-template-columns: 1fr; grid-template-rows: repeat(4, 1fr); overflow-y: auto; }
+    }
+    /* Individual Chart Pane */
+    .chart-pane {
+      background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px;
+      display: flex; flex-direction: column; position: relative; overflow: hidden;
+    }
+    .chart-pane.alert-flash {
+      animation: flashBorder 0.8s ease-out;
+    }
+    @keyframes flashBorder {
+      0% { box-shadow: inset 0 0 25px #f59e0b; border-color: #f59e0b; }
+      100% { box-shadow: none; border-color: var(--border); }
+    }
+    .pane-header {
+      height: 30px; background: rgba(22, 29, 43, 0.95); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 6px; gap: 4px; flex-shrink: 0; overflow-x: auto;
+    }
+    .pane-controls { display: flex; align-items: center; gap: 4px; }
+    .pane-controls input.sym-input { width: 78px; text-transform: uppercase; font-weight: 700; color: #38bdf8; }
+    .pane-metrics {
+      display: flex; align-items: center; gap: 8px; font-size: 11px; white-space: nowrap;
+    }
+    .canvas-wrap {
+      flex: 1; position: relative; width: 100%; height: 100%; overflow: hidden;
+    }
+    canvas {
+      display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none;
+    }
+    .whale-toast {
+      position: absolute; top: 36px; left: 8px; pointer-events: none;
+      display: flex; flex-direction: column; gap: 3px; z-index: 10;
+    }
+    .whale-item {
+      background: rgba(15, 23, 42, 0.9); border-left: 3px solid var(--poc);
+      padding: 2px 6px; font-size: 10px; border-radius: 2px; color: #fde68a;
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+  <!-- Master Toolbar -->
+  <div class="top-bar">
+    <div class="brand">
+      <span class="status-dot"></span>
+      <span>ORDERFLOW PRO</span>
+      <span class="badge" id="db-status">IndexedDB: Ready (7D Cache)</span>
+    </div>
+
+    <div class="toolbar-group">
+      <span style="color:var(--text-muted)">Layout:</span>
+      <button class="btn" onclick="setLayout(1)" id="btn-layout-1">1x1</button>
+      <button class="btn" onclick="setLayout(2)" id="btn-layout-2">1x2</button>
+      <button class="btn active" onclick="setLayout(4)" id="btn-layout-4">2x2 (4 Screens)</button>
+    </div>
+
+    <div class="toolbar-group">
+      <span style="color:var(--text-muted)">Right Side:</span>
+      <select id="global-fp-mode" onchange="updateGlobalSettings()">
+        <option value="VOL_DELTA" selected>Left: Vol | Right: Delta</option>
+        <option value="BID_ASK">Left: Bid | Right: Ask</option>
+      </select>
+
+      <span style="color:var(--text-muted)">Imbalance:</span>
+      <select id="global-imb-ratio" onchange="updateGlobalSettings()">
+        <option value="2.5">250%</option>
+        <option value="3.0" selected>300% (3x)</option>
+        <option value="4.0">400% (4x)</option>
+      </select>
+
+      <span style="color:var(--text-muted)">Whale Filter:</span>
+      <select id="global-whale-min" onchange="updateGlobalSettings()">
+        <option value="0.5">>= 0.5 BTC</option>
+        <option value="1.0" selected>>= 1.0 BTC</option>
+        <option value="3.0">>= 3.0 BTC</option>
+        <option value="5.0">>= 5.0 BTC</option>
+      </select>
+
+      <button class="btn active" id="btn-vp" onclick="toggleFeature('showVP')">Vol Profile + VAH/VAL</button>
+      <button class="btn active" id="btn-vwap" onclick="toggleFeature('showVWAP')">VWAP</button>
+      <button class="btn active" id="btn-audio" onclick="toggleFeature('audioAlerts')">🔔 Audio Alerts</button>
+      <button class="btn" onclick="clearLocalCache()" title="Reset 7-day local cache">Clear Cache</button>
+    </div>
+  </div>
+
+  <!-- 1 to 4 Screen Dynamic Grid -->
+  <div id="grid-container" class="grid-4"></div>
+</div>
+
+<script>
+// ============================================================================
+// 1. PWA MANIFEST & iOS HOME SCREEN ICON GENERATOR (SINGLE-FILE SELF-CONTAINED)
+// ============================================================================
+(function initPWA() {
+  const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
+    <rect width="192" height="192" rx="36" fill="#0b0e14"/>
+    <rect x="28" y="44" width="36" height="104" rx="4" fill="#10b981"/>
+    <rect x="78" y="28" width="36" height="136" rx="4" fill="#f43f5e"/>
+    <rect x="128" y="64" width="36" height="84" rx="4" fill="#38bdf8"/>
+    <line x1="20" y1="96" x2="172" y2="96" stroke="#f59e0b" stroke-width="6"/>
+  </svg>`;
+  const iconUrl = "data:image/svg+xml;base64," + btoa(iconSvg);
+
+  const appleIcon = document.createElement("link");
+  appleIcon.rel = "apple-touch-icon";
+  appleIcon.href = iconUrl;
+  document.head.appendChild(appleIcon);
+
+  const manifest = {
+    name: "OrderFlow Pro Terminal",
+    short_name: "OrderFlow",
+    start_url: ".",
+    display: "standalone",
+    background_color: "#0b0e14",
+    theme_color: "#0b0e14",
+    orientation: "any",
+    icons: [{ src: iconUrl, sizes: "192x192", type: "image/svg+xml" }]
+  };
+  const manifestLink = document.createElement("link");
+  manifestLink.rel = "manifest";
+  manifestLink.href = "data:application/manifest+json;charset=utf-8," + encodeURIComponent(JSON.stringify(manifest));
+  document.head.appendChild(manifestLink);
+})();
+
+// ============================================================================
+// 2. GLOBAL CONFIGURATION & WEB AUDIO SYNTHESIZER FOR DELTA/WHALE ALERTS
+// ============================================================================
+const APP_CONFIG = {
+  fpMode: "VOL_DELTA", // 'VOL_DELTA' or 'BID_ASK'
+  imbalanceRatio: 3.0,
+  whaleMinBTC: 1.0,
+  showVP: true,
+  showVWAP: true,
+  audioAlerts: true,
+  layoutCount: 4
+};
+
+class SoundAlertEngine {
+  constructor() {
+    this.ctx = null;
+    this.lastBeep = 0;
+  }
+  beep(freq = 880, duration = 0.08, type = "sine") {
+    if (!APP_CONFIG.audioAlerts) return;
+    const now = Date.now();
+    if (now - this.lastBeep < 1500) return; // Throttle alerts
+    this.lastBeep = now;
+    try {
+      if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (this.ctx.state === "suspended") this.ctx.resume();
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+      gain.gain.setValueAtTime(0.08, this.ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration);
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+      osc.start();
+      osc.stop(this.ctx.currentTime + duration);
+    } catch (e) {}
+  }
+}
+const soundEngine = new SoundAlertEngine();
+
+// ============================================================================
+// 3. INDEXEDDB 7-DAY LOCAL PERSISTENCE ENGINE
+// ============================================================================
+class FootprintDatabase {
+  constructor() {
+    this.dbName = "OrderFlowProDB_v1";
+    this.storeName = "candles";
+    this.db = null;
+    this.RetentionMs = 7 * 24 * 60 * 60 * 1000; // 7 Days
+  }
+
+  async init() {
+    return new Promise((resolve) => {
+      const req = indexedDB.open(this.dbName, 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(this.storeName)) {
+          const store = db.createObjectStore(this.storeName, { keyPath: "id" });
+          store.createIndex("seriesKey", "seriesKey", { unique: false });
+          store.createIndex("time", "time", { unique: false });
+        }
+      };
+      req.onsuccess = (e) => {
+        this.db = e.target.result;
+        this.pruneOldData();
+        resolve();
+      };
+      req.onerror = () => resolve();
+    });
+  }
+
+  async pruneOldData() {
+    if (!this.db) return;
+    const cutoff = Date.now() - this.RetentionMs;
+    const tx = this.db.transaction(this.storeName, "readwrite");
+    const store = tx.objectStore(this.storeName);
+    const idx = store.index("time");
+    const range = IDBKeyRange.upperBound(cutoff);
+    idx.openCursor(range).onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        store.delete(cursor.primaryKey);
+        cursor.continue();
+      }
+    };
+  }
+
+  async loadSeries(seriesKey) {
+    if (!this.db) return [];
+    return new Promise((resolve) => {
+      const tx = this.db.transaction(this.storeName, "readonly");
+      const store = tx.objectStore(this.storeName);
+      const idx = store.index("seriesKey");
+      const req = idx.getAll(IDBKeyRange.only(seriesKey));
+      req.onsuccess = () => {
+        const res = (req.result || []).sort((a, b) => a.time - b.time);
+        resolve(res);
+      };
+      req.onerror = () => resolve([]);
+    });
+  }
+
+  async saveCandles(seriesKey, candles) {
+    if (!this.db || !candles.length) return;
+    const tx = this.db.transaction(this.storeName, "readwrite");
+    const store = tx.objectStore(this.storeName);
+    const recent = candles.slice(-450); // Save latest batch
+    for (const c of recent) {
+      store.put({
+        id: `${seriesKey}_${c.time}`,
+        seriesKey,
+        time: c.time,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+        buyVol: c.buyVol,
+        sellVol: c.sellVol,
+        delta: c.delta,
+        maxDelta: c.maxDelta,
+        minDelta: c.minDelta,
+        levels: c.levels,
+        isLiveBuilt: c.isLiveBuilt || false
+      });
+    }
+  }
+
+  async clearAll() {
+    if (!this.db) return;
+    const tx = this.db.transaction(this.storeName, "readwrite");
+    tx.objectStore(this.storeName).clear();
+  }
+}
+const dbEngine = new FootprintDatabase();
+// === END OF PART 1 — PASTE PART 2 IMMEDIATELY BELOW THIS LINE ===
